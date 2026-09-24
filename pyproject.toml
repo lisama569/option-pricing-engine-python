@@ -1,10 +1,25 @@
 [project]
 name = "option-pricing-engine-python"
 version = "0.1.0"
+description = "本地可独立运行的期权定价与波动率曲面服务（BSM/CRR，版本化曲面，并发任务）"
 requires-python = ">=3.14.4"
 dependencies = [
     "fastapi[standard]>=0.141.1",
 ]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+log_cli = false
+# 单测日志中打印输入参数、所用曲面版本与判定依据（INFO 级）
+log_level = "INFO"
+log_format = "%(asctime)s %(levelname)s %(name)s %(message)s"
+log_capture_level = "INFO"
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"
