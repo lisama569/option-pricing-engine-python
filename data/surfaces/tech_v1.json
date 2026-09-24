@@ -1,0 +1,12 @@
+{
+  "expiries": [0.5, 1.0],
+  "strikes": [180, 200, 220],
+  "vols": [
+    [0.330, 0.300, 0.285],
+    [0.340, 0.305, 0.290]
+  ],
+  "spot": 200.0,
+  "rate": 0.04,
+  "dividend": 0.0,
+  "allow_extrapolation": true
+}
