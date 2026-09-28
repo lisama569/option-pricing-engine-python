@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from .data import load_bundled_surfaces
 from .jobs import JobManager, JobNotFoundError
 from .errors import (
+    ExtrapolationNotAuthorizedError,
     InvalidParameterError,
     PricingError,
     SurfaceNotFoundError,
@@ -19,7 +20,10 @@ from .errors import (
     SolverNonConvergenceError,
 )
 from .models import (
+    BatchPricingRequest,
+    BatchPricingResponse,
     ErrorBody,
+    ExtrapolationLimits,
     JobResponse,
     PriceResponse,
     PricingRequest,
@@ -32,6 +36,7 @@ from .surface import SurfaceStore
 ERROR_STATUS = {
     InvalidParameterError.code: 422,
     SurfaceOutOfRangeError.code: 422,
+    ExtrapolationNotAuthorizedError.code: 422,
     SurfaceNotFoundError.code: 404,
     SolverNonConvergenceError.code: 422,
     JobNotFoundError.code: 404,
@@ -65,12 +70,19 @@ def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager]:
     @application.exception_handler(RequestValidationError)
     def validation_error_handler(request, exc: RequestValidationError):  # noqa: ANN001
         # Unified, distinguishable failure body for illegal request parameters.
+        # Strip non-JSON-serialisable error context (e.g. ValueError ctx).
+        errors = []
+        for err in exc.errors():
+            clean = {k: v for k, v in err.items() if k != "ctx"}
+            if "ctx" in err:
+                clean["ctx"] = {k: str(v) for k, v in err["ctx"].items()}
+            errors.append(clean)
         return JSONResponse(
             status_code=422,
             content=ErrorBody(
                 error=InvalidParameterError.code,
                 message="request parameter validation failed",
-                detail={"errors": exc.errors(include_url=False)},
+                detail={"errors": errors},
             ).model_dump(mode="json"),
         )
 
@@ -81,6 +93,12 @@ def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager]:
     @application.post("/pricing/price", response_model=PriceResponse)
     def price_sync(req: PricingRequest):
         return pricing_service.price(req)
+
+    @application.post("/pricing/batch", response_model=BatchPricingResponse)
+    def price_batch(req: BatchPricingRequest):
+        # One version for the whole batch; per-item failures never fail the
+        # HTTP request itself -- they live in each item's error slot.
+        return pricing_service.price_batch(req)
 
     @application.post("/surfaces/{surface_id}/versions",
                       response_model=SurfaceVersionInfo)
@@ -99,11 +117,16 @@ def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager]:
         return _version_info(surface_store.get(surface_id, version))
 
     @application.get("/surfaces/{surface_id}/versions/{version}/vol")
-    def query_vol(surface_id: str, version: int, expiry: float, strike: float):
+    def query_vol(surface_id: str, version: int, expiry: float, strike: float,
+                  allow_extrapolation: bool = False):
         snap = surface_store.get(surface_id, version)
+        query = snap.query_vol(expiry, strike,
+                               allow_extrapolation=allow_extrapolation)
         return {"surface_id": surface_id, "version": version,
                 "expiry": expiry, "strike": strike,
-                "vol": snap.vol(expiry, strike)}
+                "vol": query.vol,
+                "extrapolated": query.audit is not None,
+                "extrapolation": query.audit}
 
     @application.post("/jobs", response_model=JobResponse, status_code=202)
     def submit_job(req: PricingRequest):
@@ -121,11 +144,13 @@ def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager]:
 
 
 def _version_info(snap) -> SurfaceVersionInfo:
+    limits = snap.extrapolation_limits
     return SurfaceVersionInfo(
         surface_id=snap.surface_id, version=snap.version,
         created_at=snap.created_at, spot=snap.spot, rate=snap.rate,
         dividend=snap.dividend,
-        allow_extrapolation=snap.allow_extrapolation,
+        extrapolation_limits=ExtrapolationLimits(**limits.as_dict())
+        if limits is not None else None,
         expiries=list(snap.expiries), strikes=list(snap.strikes),
     )
 

@@ -73,7 +73,13 @@ def bs_price(option_type: str, spot: float, strike: float, expiry: float,
 
 def american_put_crr(spot: float, strike: float, expiry: float, vol: float,
                      rate: float, dividend: float, steps: int) -> float:
-    """Single CRR binomial price for an American put."""
+    """Single CRR binomial price for an American put.
+
+    Node underlying prices use the identity
+    ``S(i,j) = spot * down**i * (up/down)**j`` with ``(up/down)**j``
+    precomputed once, so backward induction performs no repeated ``pow``
+    calls; pricing ``steps`` is an O(n**2) scan of pure multiply/max ops.
+    """
     _validate_european(spot, strike, expiry, vol, rate, dividend)
     if steps <= 0:
         raise InvalidParameterError(f"steps must be > 0, got {steps}")
@@ -86,15 +92,34 @@ def american_put_crr(spot: float, strike: float, expiry: float, vol: float,
             f"invalid CRR risk-neutral probability {p_up}; check inputs"
         )
     disc = math.exp(-rate * dt)
-    values = [
-        max(strike - spot * (up ** j) * (down ** (steps - j)), 0.0)
-        for j in range(steps + 1)
-    ]
+    p_dn = 1.0 - p_up
+
+    # m_pow[j] == (up/down)**j; terminal S(n,j) == spot*down**n*m_pow[j].
+    ratio = up / down
+    m_pow = [1.0] * (steps + 1)
+    for j in range(1, steps + 1):
+        m_pow[j] = m_pow[j - 1] * ratio
+    dn_factor = spot * (down ** steps)
+    values = [max(strike - dn_factor * m_pow[j], 0.0)
+              for j in range(steps + 1)]
+
+    # At layer i: spot*down**i tracked multiplicatively from the terminal
+    # factor (each step back multiplies by 1/down == up).
+    layer_spot = dn_factor
+    inv_down = up
     for i in range(steps - 1, -1, -1):
+        layer_spot *= inv_down
+        vals = values
+        mpow = m_pow
+        k = strike
+        d = disc
+        pu = p_up
+        pd = p_dn
+        ls = layer_spot
         for j in range(i + 1):
-            cont = disc * (p_up * values[j + 1] + (1.0 - p_up) * values[j])
-            s_ij = spot * (up ** j) * (down ** (i - j))
-            values[j] = max(cont, strike - s_ij)
+            cont = d * (pu * vals[j + 1] + pd * vals[j])
+            intrinsic = k - ls * mpow[j]
+            vals[j] = cont if cont > intrinsic else intrinsic
     return values[0]
 
 
@@ -131,6 +156,20 @@ def american_put_price(spot: float, strike: float, expiry: float, vol: float,
         f"American put price not converged within {max_steps} steps "
         f"(tol={tol}, last price={prev})"
     )
+
+
+def american_put_fixed(spot: float, strike: float, expiry: float, vol: float,
+                       rate: float, dividend: float, steps: int,
+                       cancel_event=None) -> float:
+    """Deterministic single-resolution American put: exactly ``steps`` CRR
+    steps, no convergence loop and no step substitution."""
+    if steps <= 0:
+        raise InvalidParameterError(f"steps must be > 0, got {steps}")
+    price = american_put_crr(spot, strike, expiry, vol, rate, dividend, steps)
+    if cancel_event is not None and cancel_event.is_set():
+        from .errors import JobCancelledError
+        raise JobCancelledError("cancelled during fixed-resolution solve")
+    return price
 
 
 def implied_vol(option_type: str, market_price: float, spot: float,

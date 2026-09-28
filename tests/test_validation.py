@@ -82,20 +82,44 @@ def test_surface_out_of_range_distinguishable(audit):
         assert ei.value.code == "surface_out_of_range"
 
 
-def test_extrapolation_allowed_surface(audit):
+def test_extrapolation_authorized_and_bounded(audit):
     service, store = svc()
     store.publish("default", SurfaceGridPayload(
         expiries=[0.25, 1.0], strikes=[90, 100, 110],
         vols=[[0.22, 0.20, 0.19], [0.23, 0.205, 0.195]],
-        spot=100, rate=0.05, allow_extrapolation=True))
-    audit("extrapolation_allowed",
+        spot=100, rate=0.05,
+        extrapolation_limits=dict(min_expiry=0.1, max_expiry=3.0,
+                                  min_strike=80, max_strike=150)))
+    audit("extrapolation_authorized",
           {"expiry": 3.0, "strike": 150, "version": 2},
           surface_version=2,
-          criterion="price computed with linear-extrapolated vol")
+          criterion="authorized in-range-of-limits point served + audited")
     resp = service.price(PricingRequest(
-        option_type="vanilla_call", expiry=3.0, strike=150, version=2))
+        option_type="vanilla_call", expiry=3.0, strike=150, version=2,
+        allow_extrapolation=True))
     assert resp.vol_used > 0
-    # While v1 (no extrapolation) still rejects the same query.
+    assert resp.extrapolated is True
+    assert resp.extrapolation is not None
+    assert {a["axis"] for a in resp.extrapolation["axes"]} == {
+        "expiry", "strike"}
+
+    # Same point without explicit authorization is still rejected.
+    with pytest.raises(SurfaceOutOfRangeError):
+        service.price(PricingRequest(
+            option_type="vanilla_call", expiry=3.0, strike=150, version=2))
+
+    # Beyond declared limits is rejected even with authorization.
+    with pytest.raises(SurfaceOutOfRangeError):
+        service.price(PricingRequest(
+            option_type="vanilla_call", expiry=4.0, strike=150, version=2,
+            allow_extrapolation=True))
+
+    # v1 declares no limits: authorization cannot create permission.
+    from option_engine.errors import ExtrapolationNotAuthorizedError
+    with pytest.raises(ExtrapolationNotAuthorizedError):
+        service.price(PricingRequest(
+            option_type="vanilla_call", expiry=3.0, strike=150, version=1,
+            allow_extrapolation=True))
     with pytest.raises(SurfaceOutOfRangeError):
         service.price(PricingRequest(
             option_type="vanilla_call", expiry=3.0, strike=150, version=1))
@@ -124,7 +148,9 @@ def test_american_nonconvergence_rejected(audit):
     store.publish("wide", SurfaceGridPayload(
         expiries=[0.1, 5.0], strikes=[10, 500],
         vols=[[0.2, 0.2], [0.2, 0.2]],
-        spot=50, rate=0.05, allow_extrapolation=True))
+        spot=50, rate=0.05,
+        extrapolation_limits=dict(min_expiry=0.01, max_expiry=10.0,
+                                  min_strike=1.0, max_strike=1000.0)))
     inputs = dict(option_type="american_put", surface_id="wide",
                   expiry=2.0, strike=52, spot=50,
                   steps=4, max_steps=32, convergence_tol=1e-12)

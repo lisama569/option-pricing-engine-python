@@ -78,6 +78,33 @@ def test_async_job_lifecycle_and_cancel(audit):
     assert client.get("/jobs/does-not-exist").status_code == 404
 
 
+def test_async_job_carries_fixed_resolution_and_extrapolation(audit):
+    body = {
+        "surface_id": "tech", "option_type": "american_put",
+        "expiry": 2.5, "strike": 250, "allow_extrapolation": True,
+        "resolution": 64}
+    audit("job_fixed_resolution", body, surface_version="tech/1",
+          criterion="async result mirrors sync: fixed/64 + extrapolation audit")
+    sync = client.post("/pricing/price", json=body)
+    assert sync.status_code == 200, sync.text
+    r = client.post("/jobs", json=body)
+    assert r.status_code == 202
+    job_id = r.json()["job_id"]
+    final = {}
+    for _ in range(300):
+        final = client.get(f"/jobs/{job_id}").json()
+        if final["status"] in (JobStatus.SUCCEEDED, JobStatus.FAILED,
+                               JobStatus.CANCELLED):
+            break
+        time.sleep(0.01)
+    assert final["status"] == JobStatus.SUCCEEDED, final
+    res = final["result"]
+    assert res["resolution_mode"] == "fixed"
+    assert res["resolution_used"] == 64
+    assert res["extrapolated"] is True
+    assert res["price"] == sync.json()["price"]
+
+
 def test_cancel_running_job(audit):
     from option_engine.api import jobs
     from option_engine.models import PricingRequest

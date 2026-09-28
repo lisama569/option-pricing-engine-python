@@ -18,10 +18,20 @@ class InvalidParameterError(PricingError):
 
 
 class SurfaceOutOfRangeError(PricingError):
-    """Requested (expiry, strike) lies outside the surface support and
-    extrapolation is forbidden."""
+    """Requested (expiry, strike) lies outside the region that may be served:
+
+    either outside the grid support with extrapolation not requested / not
+    declared by the surface version, or beyond that version's declared
+    extrapolation limits."""
 
     code = "surface_out_of_range"
+
+
+class ExtrapolationNotAuthorizedError(PricingError):
+    """Caller explicitly requested extrapolation against a surface version
+    that declares no extrapolation limits at all."""
+
+    code = "extrapolation_not_authorized"
 
 
 class SurfaceNotFoundError(PricingError):
