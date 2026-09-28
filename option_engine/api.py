@@ -10,6 +10,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from .data import load_bundled_surfaces
+from .batch import BatchPricer
 from .jobs import JobManager, JobNotFoundError
 from .errors import (
     InvalidParameterError,
@@ -19,6 +20,8 @@ from .errors import (
     SolverNonConvergenceError,
 )
 from .models import (
+    BatchPricingRequest,
+    BatchPricingResponse,
     ErrorBody,
     JobResponse,
     PriceResponse,
@@ -47,7 +50,7 @@ def _error_response(exc: PricingError) -> JSONResponse:
     )
 
 
-def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager]:
+def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager, BatchPricer]:
     """Build a fully wired application instance from bundled local data.
 
     The factory keeps construction explicit and lets tests spin up an
@@ -56,6 +59,7 @@ def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager]:
     surface_store = load_bundled_surfaces()
     pricing_service = PricingService(surface_store)
     job_manager = JobManager(pricing_service)
+    batch_pricer = BatchPricer(pricing_service)
     application = FastAPI(title="Option Pricing Engine", version="0.1.0")
 
     @application.exception_handler(PricingError)
@@ -70,7 +74,7 @@ def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager]:
             content=ErrorBody(
                 error=InvalidParameterError.code,
                 message="request parameter validation failed",
-                detail={"errors": exc.errors(include_url=False)},
+                detail={"errors": exc.errors()},
             ).model_dump(mode="json"),
         )
 
@@ -81,6 +85,11 @@ def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager]:
     @application.post("/pricing/price", response_model=PriceResponse)
     def price_sync(req: PricingRequest):
         return pricing_service.price(req)
+
+    @application.post("/pricing/price/batch",
+                      response_model=BatchPricingResponse)
+    def price_batch(req: BatchPricingRequest):
+        return batch_pricer.price_batch(req)
 
     @application.post("/surfaces/{surface_id}/versions",
                       response_model=SurfaceVersionInfo)
@@ -99,11 +108,17 @@ def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager]:
         return _version_info(surface_store.get(surface_id, version))
 
     @application.get("/surfaces/{surface_id}/versions/{version}/vol")
-    def query_vol(surface_id: str, version: int, expiry: float, strike: float):
+    def query_vol(surface_id: str, version: int, expiry: float, strike: float,
+                  allow_extrapolation: bool = False):
         snap = surface_store.get(surface_id, version)
+        vol, audit = snap.quote(expiry, strike,
+                                allow_extrap=allow_extrapolation)
         return {"surface_id": surface_id, "version": version,
                 "expiry": expiry, "strike": strike,
-                "vol": snap.vol(expiry, strike)}
+                "allow_extrapolation": allow_extrapolation,
+                "vol": vol,
+                "extrapolated": audit is not None,
+                "extrapolation": (audit.__dict__ if audit is not None else None)}
 
     @application.post("/jobs", response_model=JobResponse, status_code=202)
     def submit_job(req: PricingRequest):
@@ -117,17 +132,24 @@ def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager]:
     def cancel_job(job_id: str):
         return JobManager.to_response(job_manager.cancel(job_id))
 
-    return application, surface_store, pricing_service, job_manager
+    return application, surface_store, pricing_service, job_manager, batch_pricer
 
 
 def _version_info(snap) -> SurfaceVersionInfo:
+    from .models import ExtrapolationLimits
+
+    limits = None
+    if snap.extrapolation_limits is not None:
+        min_e, max_e, min_s, max_s = snap.extrapolation_limits
+        limits = ExtrapolationLimits(min_expiry=min_e, max_expiry=max_e,
+                                     min_strike=min_s, max_strike=max_s)
     return SurfaceVersionInfo(
         surface_id=snap.surface_id, version=snap.version,
         created_at=snap.created_at, spot=snap.spot, rate=snap.rate,
         dividend=snap.dividend,
-        allow_extrapolation=snap.allow_extrapolation,
+        extrapolation_limits=limits,
         expiries=list(snap.expiries), strikes=list(snap.strikes),
     )
 
 
-app, store, service, jobs = create_app()
+app, store, service, jobs, batch = create_app()

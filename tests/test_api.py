@@ -37,6 +37,76 @@ def test_http_error_envelopes_are_distinguishable(audit):
         assert err["message"]
 
 
+def test_async_job_fixed_resolution_succeeds(audit):
+    r = client.post("/jobs", json={
+        "surface_id": "tech", "version": 1,
+        "option_type": "american_put", "expiry": 0.75, "strike": 200,
+        "spot": 200, "resolution": 41})
+    assert r.status_code == 202
+    job_id = r.json()["job_id"]
+    audit("job_fixed_resolution", {"job_id": job_id, "resolution": 41},
+          surface_version="tech/1",
+          criterion="SUCCEEDED; fixed_resolution with exactly 41 steps")
+    final = {}
+    for _ in range(200):
+        final = client.get(f"/jobs/{job_id}").json()
+        if final["status"] in (JobStatus.SUCCEEDED, JobStatus.FAILED,
+                               JobStatus.CANCELLED):
+            break
+        time.sleep(0.01)
+    assert final["status"] == JobStatus.SUCCEEDED
+    assert final["result"]["pricing_mode"] == "fixed_resolution"
+    assert final["result"]["steps_used"] == 41
+
+
+def test_http_extrapolation_requires_opt_in_and_audits(audit):
+    # tech v1 declares a limited extrapolation range.
+    base = "/surfaces/tech/versions/1/vol?expiry=2.0&strike=250"
+    audit("vol_extrap_default", {"expiry": 2.0, "strike": 250},
+          surface_version="tech/1",
+          criterion="default query rejected (422 surface_out_of_range)")
+    assert client.get(base).status_code == 422
+    ok = client.get(base + "&allow_extrapolation=true")
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert body["extrapolated"] is True
+    assert body["extrapolation"]["expiry_outside"] is True
+    # Beyond the declared range: rejected even with opt-in.
+    far = ("/surfaces/tech/versions/1/vol?expiry=5.0&strike=250"
+           "&allow_extrapolation=true")
+    assert client.get(far).status_code == 422
+    # Pricing path carries the same audit fields.
+    r = client.post("/pricing/price", json={
+        "surface_id": "tech", "version": 1,
+        "option_type": "vanilla_call", "expiry": 2.0, "strike": 250,
+        "allow_extrapolation": True})
+    assert r.status_code == 200
+    assert r.json()["extrapolated"] is True
+    assert r.json()["extrapolation"]["strike_overhang"] == 30.0
+
+
+def test_http_batch_partial_failures(audit):
+    body = {"surface_id": "tech", "version": 1, "items": [
+        {"option_type": "vanilla_call", "expiry": 1.0, "strike": 200},
+        {"option_type": "vanilla_call", "expiry": 9.0, "strike": 200,
+         "allow_extrapolation": True},
+        {"option_type": "american_put", "expiry": 0.75, "strike": 200,
+         "spot": 200, "resolution": 17},
+    ]}
+    audit("http_batch", {"legs": 3, "bad": [1]}, surface_version="tech/1",
+          criterion="200; leg 1 fails alone with surface_out_of_range; "
+                    "fixed-resolution leg reports mode/steps")
+    r = client.post("/pricing/price/batch", json=body)
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert [x["index"] for x in results] == [0, 1, 2]
+    assert results[0]["status"] == "succeeded"
+    assert results[1]["status"] == "failed"
+    assert results[1]["error_code"] == "surface_out_of_range"
+    assert results[2]["result"]["pricing_mode"] == "fixed_resolution"
+    assert results[2]["result"]["steps_used"] == 17
+
+
 def test_publish_and_fetch_versions(audit):
     payload = {"expiries": [0.5, 1.0], "strikes": [95, 100, 105],
                "vols": [[0.21, 0.20, 0.195], [0.22, 0.205, 0.20]],

@@ -87,18 +87,41 @@ def test_extrapolation_allowed_surface(audit):
     store.publish("default", SurfaceGridPayload(
         expiries=[0.25, 1.0], strikes=[90, 100, 110],
         vols=[[0.22, 0.20, 0.19], [0.23, 0.205, 0.195]],
-        spot=100, rate=0.05, allow_extrapolation=True))
-    audit("extrapolation_allowed",
-          {"expiry": 3.0, "strike": 150, "version": 2},
+        spot=100, rate=0.05,
+        extrapolation_limits=dict(min_expiry=0.1, max_expiry=3.0,
+                                  min_strike=80, max_strike=150)))
+    # Even a surface that declares an extrapolation range rejects unless the
+    # caller explicitly opts in.
+    audit("extrapolation_default_denied",
+          {"expiry": 3.0, "strike": 150, "version": 2, "allow": False},
           surface_version=2,
-          criterion="price computed with linear-extrapolated vol")
-    resp = service.price(PricingRequest(
-        option_type="vanilla_call", expiry=3.0, strike=150, version=2))
-    assert resp.vol_used > 0
-    # While v1 (no extrapolation) still rejects the same query.
+          criterion="opt-in is required: SurfaceOutOfRangeError")
     with pytest.raises(SurfaceOutOfRangeError):
         service.price(PricingRequest(
-            option_type="vanilla_call", expiry=3.0, strike=150, version=1))
+            option_type="vanilla_call", expiry=3.0, strike=150, version=2))
+
+    audit("extrapolation_allowed",
+          {"expiry": 3.0, "strike": 150, "version": 2, "allow": True},
+          surface_version=2,
+          criterion="price computed with linear-extrapolated vol, audited")
+    resp = service.price(PricingRequest(
+        option_type="vanilla_call", expiry=3.0, strike=150, version=2,
+        allow_extrapolation=True))
+    assert resp.vol_used > 0
+    assert resp.extrapolated is True
+    assert resp.extrapolation is not None
+    assert resp.extrapolation.expiry_outside is True
+    assert resp.extrapolation.strike_outside is True
+    # Beyond the declared range: still rejected even with opt-in.
+    with pytest.raises(SurfaceOutOfRangeError):
+        service.price(PricingRequest(
+            option_type="vanilla_call", expiry=9.0, strike=150, version=2,
+            allow_extrapolation=True))
+    # While v1 (no declared range) rejects the same query even with opt-in.
+    with pytest.raises(SurfaceOutOfRangeError):
+        service.price(PricingRequest(
+            option_type="vanilla_call", expiry=3.0, strike=150, version=1,
+            allow_extrapolation=True))
 
 
 def test_missing_surface_and_version(audit):
@@ -124,7 +147,9 @@ def test_american_nonconvergence_rejected(audit):
     store.publish("wide", SurfaceGridPayload(
         expiries=[0.1, 5.0], strikes=[10, 500],
         vols=[[0.2, 0.2], [0.2, 0.2]],
-        spot=50, rate=0.05, allow_extrapolation=True))
+        spot=50, rate=0.05,
+        extrapolation_limits=dict(min_expiry=0.01, max_expiry=10.0,
+                                  min_strike=1.0, max_strike=1000.0)))
     inputs = dict(option_type="american_put", surface_id="wide",
                   expiry=2.0, strike=52, spot=50,
                   steps=4, max_steps=32, convergence_tol=1e-12)

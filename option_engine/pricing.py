@@ -133,6 +133,27 @@ def american_put_price(spot: float, strike: float, expiry: float, vol: float,
     )
 
 
+def american_put_fixed(spot: float, strike: float, expiry: float, vol: float,
+                       rate: float, dividend: float, resolution: int,
+                       cancel_event=None) -> tuple[float, dict]:
+    """Deterministic American put at an exact, caller-specified resolution.
+
+    The CRR tree is built with exactly ``resolution`` steps; no convergence
+    search or step substitution is performed, so the same request on the
+    same surface version always yields bit-identical output.
+    """
+    if cancel_event is not None and cancel_event.is_set():
+        from .errors import JobCancelledError
+        raise JobCancelledError("cancelled before fixed-resolution solve")
+    price = american_put_crr(spot, strike, expiry, vol, rate, dividend,
+                             resolution)
+    if cancel_event is not None and cancel_event.is_set():
+        from .errors import JobCancelledError
+        raise JobCancelledError("cancelled during fixed-resolution solve")
+    return price, {"steps_used": resolution, "converged": None,
+                   "resolution": resolution}
+
+
 def implied_vol(option_type: str, market_price: float, spot: float,
                 strike: float, expiry: float, rate: float, dividend: float,
                 vol_lo: float = 1e-6, vol_hi: float = 5.0,
