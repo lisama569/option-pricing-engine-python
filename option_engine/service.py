@@ -55,6 +55,16 @@ class PricingService:
             from .errors import JobCancelledError
             raise JobCancelledError("cancelled before computation")
 
+        # Engine-layer defence in depth: re-apply the strict resolution rule
+        # so a request built via model_construct (bypassing the pydantic
+        # validator) can never smuggle a bool/float/string/out-of-range
+        # value into the tree as some coerced step count.
+        try:
+            from .models import validate_resolution
+            validate_resolution(req.resolution)
+        except (ValueError, TypeError) as exc:
+            raise InvalidParameterError(str(exc))
+
         # Fixed discrete resolution is meaningful only for the binomial
         # American put; reject explicitly instead of silently ignoring it.
         if req.resolution is not None and req.option_type.value != "american_put":

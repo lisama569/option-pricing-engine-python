@@ -28,9 +28,26 @@
   不替换步数。结果是 `(请求, 曲面版本)` 的确定性函数，同一曲面版本反复跑
   逐位相同，适合复现“固定期数/固定步长”的第三方报价。
   - 允许范围 **N ∈ [1, 2000]**（常量 `models.MIN_RESOLUTION` /
-    `MAX_RESOLUTION`），区间内每个整数都受理并实际计算；
-  - 越界（0、负数、>2000）由模型层以 `invalid_parameter`（HTTP 422）
+    `MAX_RESOLUTION`），区间内每个整数都受理并实际计算，**含 1 和 2000
+    两个边界**；
+  - **只接受“真正的整数”（JSON 中不带引号、不带小数点的整数）**。
+    Pydantic 默认的宽松换算已被显式关闭：`true`/`false`（布尔）、
+    `5.0`/`5.5`（浮点，哪怕是整数值的 `2000.0`）、`"5"`/`"5.0"`/`"true"`
+    （数字/布尔字符串）、数组或对象等一律**不换算、不替换成任何步数**，
+    在模型层即以 `invalid_parameter`（HTTP 422）明确拒绝；
+  - 越界（0、负数、>2000）同样由模型层以 `invalid_parameter`（HTTP 422）
     **明确拒绝**，不会在未到上限时报错，也不会悄悄换成其他步数给近似值；
+  - 失败原因**可区分**：结构化错误 `detail.errors[].type` 为
+    `resolution_bad_type`（类型非法：布尔/浮点/字符串等）或
+    `resolution_out_of_range`（整数但越界），`loc` 精确指向
+    `resolution` 字段，`message` 同时写明字段名、实际类型/取值和受理规则；
+  - **三个入口同一套判定、同一措辞**：同步 `POST /pricing/price` 与异步
+    `POST /jobs` 在请求进入时返回 422（异步任务非法时在提交时即被拒，
+    不会创建任务）；批量 `POST /pricing/price/batch` 中某条腿的
+    `resolution` 非法时**只让该条腿失败**（该腿 `status:"failed"`、
+    `error_code:"invalid_parameter"`、消息含
+    `resolution [resolution_bad_type|resolution_out_of_range]: ...`），
+    其余腿照常定价，整批仍为 200，绝不因一条非法值拖垮整批；
   - `resolution` 只对 `american_put` 合法，欧式闭式解传该字段会收到
     `invalid_parameter`；
   - 固定模式下 `steps / convergence_tol / max_steps` 不参与计算；
@@ -137,7 +154,10 @@
 - **与单条调用完全一致**：每条 leg 在内部被构造成与独立调用完全相同的
   `PricingRequest`（含批次绑定的版本）并走同一计算与结果缓存路径，
   因此同一版本下批量每条价格、`vol_used`、`pricing_mode`、`steps_used`、
-  外插审计均与单独调用严格相同。
+  外插审计均与单独调用严格相同；参数校验规则也完全一致——例如某条腿传
+  `"resolution": true` 或 `5.0` 或 `"5"`，只有该条腿收到
+  `invalid_parameter`（消息带 `resolution_bad_type` 等可区分类型码），
+  其他腿不受影响、也不会被串行拖住。
 
 请求/响应示例：
 
@@ -220,6 +240,20 @@ curl -s -X POST localhost:8000/pricing/price -H 'Content-Type: application/json'
   "surface_id":"default","version":1,"option_type":"american_put",
   "expiry":1,"strike":100,"resolution":252}'
 
+# 非法分辨率类型 -> 422 invalid_parameter（绝不换算成 1 步给价）
+# true / 5.0 / "5" 分别返回 type=resolution_bad_type；0 / -1 / 2001
+# 返回 type=resolution_out_of_range；loc 均指向 body.resolution
+curl -s -i -X POST localhost:8000/pricing/price -H 'Content-Type: application/json' -d '{
+  "surface_id":"tech","version":1,"option_type":"american_put",
+  "expiry":0.75,"strike":200,"spot":200,"resolution":true}'
+
+# 批量：非法分辨率只失败对应那一条（整批仍 200，其余腿正常给价）
+curl -s -X POST localhost:8000/pricing/price/batch -H 'Content-Type: application/json' -d '{
+  "surface_id":"tech","version":1,"items":[
+    {"option_type":"american_put","expiry":0.75,"strike":200,"spot":200,"resolution":17},
+    {"option_type":"american_put","expiry":0.75,"strike":200,"spot":200,"resolution":true},
+    {"option_type":"vanilla_call","expiry":1,"strike":200}]}'
+
 # 在曲面声明的范围内显式请求外插（响应带 extrapolation 审计块）
 curl -s -X POST localhost:8000/pricing/price -H 'Content-Type: application/json' -d '{
   "surface_id":"tech","version":1,"option_type":"vanilla_call",
@@ -236,14 +270,45 @@ curl -s -X POST localhost:8000/pricing/price/batch -H 'Content-Type: application
 ## 6. 验证方法
 
 ```bash
-uv run pytest                       # 全部用例（45 个）
+uv run pytest                       # 全部用例（76 个）
 uv run pytest tests/test_pricing_benchmark.py -v   # 解析基准对照
 uv run pytest tests/test_resolution.py -v          # 固定分辨率/上下边界/确定性
+uv run pytest tests/test_resolution_validation.py -v  # 本次修复：类型收紧/三入口一致
 uv run pytest tests/test_extrapolation.py -v       # 外插授权/审计/历史版本
 uv run pytest tests/test_batch.py -v               # 批量：部分失败/版本一致/慢条隔离
 uv run pytest tests/test_validation.py -v          # 非法/越界/不收敛
 uv run pytest tests/test_concurrency.py -v         # 并发发布/版本回放
 uv run pytest tests/test_api.py -v                 # HTTP 契约/取消/外插/批量
+```
+
+### 6.1 本次“分辨率非法类型”修复的本地复现
+
+`tests/test_resolution_validation.py` 稳定复现并锁定修复行为：
+
+- 非法类型（`true`/`false`、`5.0`/`5.5`/`2000.0`、`"5"`/`"5.0"`/`"true"`、
+  数组等）在**同步、异步、批量三个入口**都被明确拒绝，422/失败原因带
+  `resolution_bad_type` 且点名 `resolution` 字段；非法整数（0、负数、
+  2001）带 `resolution_out_of_range`，两类原因互不混淆；
+- 合法边界整数 1 与 2000 在同步入口照常 200，按该步数确定性计算
+  （`pricing_mode="fixed_resolution"`、`steps_used` 为实际步数），
+  同一曲面版本反复跑价格逐位相同，且 1 步价 ≠ 2000 步价（证明无替换）；
+- 批量中 4 条非法腿各自只失败自己、带各自原因，合法腿（固定分辨率腿与
+  闭式解腿）照常返回；批量腿结果与单独同步调用的价格/模式/步数完全一致；
+- 既有的定价基准、历史版本回放、外插授权/审计、并发发布与任务取消用例
+  全部继续通过（无回归）。
+
+不起服务也可直接验证模型规则：
+
+```bash
+uv run python -c "
+from option_engine.models import PricingRequest
+from pydantic import ValidationError
+for v in [True, 5.0, '5', 0, 2001]:
+    try:
+        PricingRequest(option_type='american_put', expiry=1, strike=100, resolution=v)
+        print(repr(v), 'ACCEPTED  <-- 不应出现')
+    except ValidationError as e:
+        print(repr(v), 'REJECTED', e.errors()[0]['type'])"
 ```
 
 测试日志（stdout 与 caplog 均有）对每个用例打印：
@@ -259,15 +324,15 @@ CASE=version_replay | INPUTS={'versions': [1, 2, 3]} | SURFACE_VERSION=[1,2,3]
 
 ```
 option_engine/
-  errors.py     # 可区分失败原因的异常层级
-  models.py     # Pydantic 请求/响应模型（含分辨率上下界、外插范围、批量模型）
+  errors.py     # 可区分失败原因的异常层级 + 统一校验错误消息格式化
+  models.py     # Pydantic 模型（resolution 严格整数/区间校验、外插范围、批量模型）
   surface.py    # 不可变快照、双线性插值、外插授权与审计、版本化存储（原子发布）
   pricing.py    # BSM/数字闭式解、CRR 美式（自动收敛/固定分辨率）、隐含波动率
   service.py    # 版本绑定 + 规范化结果缓存（跨路径一致性）
-  batch.py      # 批量定价：单版本绑定、逐条并发、单条失败隔离
+  batch.py      # 批量定价：单版本绑定、逐条并发、单条失败隔离（含参数校验失败）
   jobs.py       # 线程池异步任务、状态机、协作取消
   data.py       # 本地 JSON 曲面载入
   api.py        # FastAPI 路由与错误映射
 data/surfaces/  # 本地曲面数据（default v1/v2 禁外插、tech v1 声明外插范围）
-tests/          # 基准/分辨率/外插/批量/非法参数/并发/HTTP 七组测试
+tests/          # 基准/分辨率/分辨率严格校验/外插/批量/非法参数/并发/HTTP 八组测试
 ```

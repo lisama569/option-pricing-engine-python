@@ -2,15 +2,74 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from pydantic_core import PydanticCustomError
 
 # Discrete-resolution bounds for the deterministic binomial pricer. Every
 # integer in [MIN_RESOLUTION, MAX_RESOLUTION] is accepted and computed
 # exactly; values outside are rejected (never silently substituted).
 MIN_RESOLUTION = 1
 MAX_RESOLUTION = 2000
+
+
+def _describe_resolution_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, float):
+        return "float"
+    return type(value).__name__
+
+
+def validate_resolution(value: Any) -> int | None:
+    """Strictly validate the discrete ``resolution`` step count.
+
+    Only ``None`` (unset) and genuine integers within
+    ``[MIN_RESOLUTION, MAX_RESOLUTION]`` are accepted. Pydantic's lax mode
+    would otherwise coerce ``True``->1, ``5.0``->5 and ``"5"``->5; those
+    coercions are explicitly forbidden so an illegal value can never be
+    silently priced as some other step count.
+
+    Raises ``PydanticCustomError`` with a distinguishable type:
+      * ``resolution_bad_type``  — not an exact JSON integer (bool/float/str)
+      * ``resolution_out_of_range`` — integer outside the allowed interval
+    """
+    if value is None:
+        return None
+    # bool is a subclass of int, so it must be rejected before the int check.
+    if isinstance(value, bool):
+        raise PydanticCustomError(
+            "resolution_bad_type",
+            "resolution must be an exact integer step count in "
+            "[{min_resolution}, {max_resolution}]; got a boolean "
+            "({value_literal}), which is never coerced to a step count",
+            {"min_resolution": MIN_RESOLUTION, "max_resolution": MAX_RESOLUTION,
+             "value_literal": str(value).lower(), "actual_type": "boolean"},
+        )
+    if not isinstance(value, int):
+        raise PydanticCustomError(
+            "resolution_bad_type",
+            "resolution must be an exact integer step count in "
+            "[{min_resolution}, {max_resolution}]; got {actual_type} "
+            "{value_repr} — send a JSON integer without quotes or decimal "
+            "point; floats and numeric strings are not coerced",
+            {"min_resolution": MIN_RESOLUTION, "max_resolution": MAX_RESOLUTION,
+             "actual_type": _describe_resolution_value(value),
+             "value_repr": str(value)},
+        )
+    if not MIN_RESOLUTION <= value <= MAX_RESOLUTION:
+        raise PydanticCustomError(
+            "resolution_out_of_range",
+            "resolution must be an integer in [{min_resolution}, "
+            "{max_resolution}]; got {value}, which is outside the allowed "
+            "range and is never substituted by another step count",
+            {"min_resolution": MIN_RESOLUTION, "max_resolution": MAX_RESOLUTION,
+             "value": value},
+        )
+    return value
 
 
 class OptionType(str, Enum):
@@ -55,12 +114,21 @@ class PricingRequest(BaseModel):
     # Fixed discrete resolution (American put only): when set, the CRR tree
     # is built with exactly this many steps and no convergence search is
     # performed. The result is deterministic for a bound surface version.
+    # The strict before-validator rejects bools/floats/strings outright;
+    # no value is ever coerced into another step count.
     resolution: int | None = Field(
         default=None,
         ge=MIN_RESOLUTION,
         le=MAX_RESOLUTION,
-        description="Exact binomial step count; bypasses convergence search",
+        description="Exact binomial step count; JSON integer in "
+                    f"[{MIN_RESOLUTION}, {MAX_RESOLUTION}] only; bypasses "
+                    "convergence search",
     )
+
+    @field_validator("resolution", mode="before")
+    @classmethod
+    def _resolution_is_strict_integer(cls, value: Any) -> int | None:
+        return validate_resolution(value)
 
     # Extrapolation is opt-in per request and is honoured only inside the
     # extrapolation range declared by the bound surface version.
@@ -181,8 +249,11 @@ class BatchPricingItem(BaseModel):
     dividend: float | None = Field(default=None, ge=0)
     payout: float = Field(default=1.0, gt=0)
 
-    resolution: int | None = Field(default=None,
-                                   ge=MIN_RESOLUTION, le=MAX_RESOLUTION)
+    # NOTE: deliberately untyped/unconstrained at the batch-envelope layer.
+    # An illegal resolution on one leg must fail ONLY that leg (the leg is
+    # rebuilt into PricingRequest, where the strict validator runs); letting
+    # the envelope reject it would fail the whole batch.
+    resolution: Any = None
     allow_extrapolation: bool = False
 
     steps: int = Field(default=500, gt=0, le=20000)

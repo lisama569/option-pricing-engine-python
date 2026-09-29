@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
-from .errors import PricingError
+from pydantic import ValidationError
+
+from .errors import PricingError, format_validation_errors
 from .models import (
     BatchPricingRequest,
     BatchPricingResponse,
@@ -74,6 +76,14 @@ class BatchPricer:
             resp = self._service.price(req)
             return BatchPricingResult(index=index, status="succeeded",
                                       result=resp)
+        except ValidationError as exc:
+            # Illegal leg parameters (e.g. resolution=true / 5.0 / "5") are
+            # rejected HERE, confined to this leg, with the same strict rule
+            # and distinguishable code as the single-request path.
+            return BatchPricingResult(
+                index=index, status="failed",
+                error_code="invalid_parameter",
+                error_message=format_validation_errors(exc.errors()))
         except PricingError as exc:
             return BatchPricingResult(
                 index=index, status="failed",

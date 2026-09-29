@@ -18,6 +18,7 @@ from .errors import (
     SurfaceNotFoundError,
     SurfaceOutOfRangeError,
     SolverNonConvergenceError,
+    format_validation_errors,
 )
 from .models import (
     BatchPricingRequest,
@@ -69,12 +70,15 @@ def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager, Bat
     @application.exception_handler(RequestValidationError)
     def validation_error_handler(request, exc: RequestValidationError):  # noqa: ANN001
         # Unified, distinguishable failure body for illegal request parameters.
+        # The top-level message names every offending field and the reason,
+        # and detail.errors keeps the structured, machine-readable form.
+        errors = exc.errors()
         return JSONResponse(
             status_code=422,
             content=ErrorBody(
                 error=InvalidParameterError.code,
-                message="request parameter validation failed",
-                detail={"errors": exc.errors()},
+                message=format_validation_errors(errors),
+                detail={"errors": errors},
             ).model_dump(mode="json"),
         )
 
