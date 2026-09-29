@@ -15,6 +15,7 @@ import threading
 from . import pricing
 from .errors import InvalidParameterError
 from .models import ExtrapolationInfo, PriceResponse, PricingRequest
+from .resolution import validate_resolution
 from .surface import SurfaceStore
 
 
@@ -55,9 +56,15 @@ class PricingService:
             from .errors import JobCancelledError
             raise JobCancelledError("cancelled before computation")
 
+        # Defence in depth: enforce the exact shared resolution rules at the
+        # engine layer too, so a request object that bypassed model
+        # validation (e.g. model_construct) can never feed a bool/float/string
+        # or out-of-range value into the binomial pricer. No substitution.
+        resolution = validate_resolution(req.resolution)
+
         # Fixed discrete resolution is meaningful only for the binomial
         # American put; reject explicitly instead of silently ignoring it.
-        if req.resolution is not None and req.option_type.value != "american_put":
+        if resolution is not None and req.option_type.value != "american_put":
             raise InvalidParameterError(
                 "resolution is supported only for american_put; "
                 f"option_type was {req.option_type.value}"
@@ -104,13 +111,13 @@ class PricingService:
             steps_used = None
             detail: dict = {"spot": spot, "rate": rate, "dividend": dividend}
         elif opt == "american_put":
-            if req.resolution is not None:
+            if resolution is not None:
                 price, info = pricing.american_put_fixed(
                     spot, req.strike, req.expiry, vol, rate, dividend,
-                    req.resolution, cancel_event=cancel_event,
+                    resolution, cancel_event=cancel_event,
                 )
                 mode = "fixed_resolution"
-                steps_used = req.resolution
+                steps_used = resolution
             else:
                 price, info = pricing.american_put_price(
                     spot, req.strike, req.expiry, vol, rate, dividend,

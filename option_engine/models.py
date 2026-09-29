@@ -2,15 +2,46 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field
+from pydantic.functional_validators import BeforeValidator
 
-# Discrete-resolution bounds for the deterministic binomial pricer. Every
-# integer in [MIN_RESOLUTION, MAX_RESOLUTION] is accepted and computed
-# exactly; values outside are rejected (never silently substituted).
-MIN_RESOLUTION = 1
-MAX_RESOLUTION = 2000
+from .errors import InvalidParameterError
+from .resolution import (
+    MAX_RESOLUTION,
+    MIN_RESOLUTION,
+    RANGE_TEXT,
+    validate_resolution,
+)
+
+
+def _strict_resolution(value):
+    """Before-validator enforcing the shared resolution rules at the model
+    layer for the single/async entry points.
+
+    Booleans, floats and strings are rejected here (Pydantic's lax int
+    coercion would otherwise turn ``true``/``1.0``/``"100"`` into steps),
+    and the explanatory reason is surfaced verbatim in the 422 body.
+    """
+    try:
+        return validate_resolution(value)
+    except InvalidParameterError as exc:
+        # ValueError inside a validator becomes a field-scoped
+        # RequestValidationError carrying our exact, distinguishable message.
+        raise ValueError(str(exc)) from exc
+
+
+# Exact ints (or omitted) only; never a coerced bool/float/string.
+StrictResolution = Annotated[
+    int | None,
+    BeforeValidator(_strict_resolution),
+]
+
+# Discrete-resolution bounds live in option_engine.resolution so the single
+# validation rule can be shared by all entry points without an import cycle.
+# MIN_RESOLUTION / MAX_RESOLUTION are imported above and remain available as
+# ``option_engine.models.MIN_RESOLUTION`` (backward-compatible re-export).
 
 
 class OptionType(str, Enum):
@@ -55,11 +86,20 @@ class PricingRequest(BaseModel):
     # Fixed discrete resolution (American put only): when set, the CRR tree
     # is built with exactly this many steps and no convergence search is
     # performed. The result is deterministic for a bound surface version.
-    resolution: int | None = Field(
+    #
+    # Type rules are deliberately strict and identical across every entry
+    # point: only an exact int in [MIN_RESOLUTION, MAX_RESOLUTION] (both
+    # boundaries included) is accepted; booleans, floats (even 1.0) and
+    # numeric strings are rejected, never coerced into a step count.
+    resolution: StrictResolution = Field(
         default=None,
         ge=MIN_RESOLUTION,
         le=MAX_RESOLUTION,
-        description="Exact binomial step count; bypasses convergence search",
+        description=(
+            f"Exact binomial step count; {RANGE_TEXT} only; bypasses "
+            "convergence search. Booleans, floats and numeric strings are "
+            "rejected, never converted to another step count."
+        ),
     )
 
     # Extrapolation is opt-in per request and is honoured only inside the
@@ -181,8 +221,18 @@ class BatchPricingItem(BaseModel):
     dividend: float | None = Field(default=None, ge=0)
     payout: float = Field(default=1.0, gt=0)
 
-    resolution: int | None = Field(default=None,
-                                   ge=MIN_RESOLUTION, le=MAX_RESOLUTION)
+    # Kept as the raw JSON value on purpose: a bad resolution on one leg
+    # must fail that leg only (per-leg invalid_parameter) rather than fail
+    # the whole batch at request-body validation. The exact shared rules in
+    # option_engine.resolution are applied per leg when it is executed.
+    resolution: Any = Field(
+        default=None,
+        description=(
+            f"Exact binomial step count; {RANGE_TEXT} only. Booleans, "
+            "floats and numeric strings are rejected for this leg, never "
+            "converted to another step count."
+        ),
+    )
     allow_extrapolation: bool = False
 
     steps: int = Field(default=500, gt=0, le=20000)

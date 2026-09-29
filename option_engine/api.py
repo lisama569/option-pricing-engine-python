@@ -68,13 +68,41 @@ def create_app() -> tuple[FastAPI, SurfaceStore, PricingService, JobManager, Bat
 
     @application.exception_handler(RequestValidationError)
     def validation_error_handler(request, exc: RequestValidationError):  # noqa: ANN001
-        # Unified, distinguishable failure body for illegal request parameters.
+        # Unified, distinguishable failure body for illegal request
+        # parameters. The message names the offending field(s) and why the
+        # value is not accepted; detail keeps the structured per-field errors.
+        detail_errors = []
+        parts = []
+        for err in exc.errors():
+            # Make every entry JSON-safe (ctx may carry non-serialisable
+            # exception objects) while keeping loc/type/msg/input intact.
+            safe = {"loc": list(err.get("loc", [])),
+                    "type": err.get("type"),
+                    "msg": err.get("msg", "")}
+            if "input" in err:
+                try:
+                    import json as _json
+                    safe["input"] = _json.loads(_json.dumps(err["input"],
+                                                            default=str))
+                except Exception:  # pragma: no cover - defensive
+                    safe["input"] = repr(err["input"])
+            detail_errors.append(safe)
+
+            loc = ".".join(str(p) for p in err.get("loc", [])) or "<body>"
+            msg = err.get("msg", "")
+            # Pydantic prefixes our validator's ValueError text; strip it so
+            # the field-specific reason reads directly.
+            if msg.startswith("Value error, "):
+                msg = msg[len("Value error, "):]
+            parts.append(f"{loc}: {msg}")
+        message = "request parameter validation failed — " + "; ".join(parts)
+
         return JSONResponse(
             status_code=422,
             content=ErrorBody(
                 error=InvalidParameterError.code,
-                message="request parameter validation failed",
-                detail={"errors": exc.errors()},
+                message=message,
+                detail={"errors": detail_errors},
             ).model_dump(mode="json"),
         )
 

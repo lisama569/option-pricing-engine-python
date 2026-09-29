@@ -17,6 +17,7 @@ from .models import (
     BatchPricingResult,
     PricingRequest,
 )
+from .resolution import validate_resolution
 from .service import PricingService
 
 
@@ -51,6 +52,13 @@ class BatchPricer:
     def _price_one(self, surface_id: str, version: int, index: int,
                    item) -> BatchPricingResult:
         try:
+            # Apply the SAME resolution rules as the single/async entry
+            # points. BatchPricingItem keeps the raw value on purpose so an
+            # illegal resolution fails THIS leg only (per-leg
+            # invalid_parameter with its own reason) instead of failing the
+            # whole batch at request-body validation. Nothing is substituted
+            # and no price is produced for a rejected leg.
+            resolution = validate_resolution(item.resolution)
             # Materialise the identical request object a standalone caller
             # would send, bound to the batch-pinned version. Item-level
             # validation failures stay confined to this leg.
@@ -64,7 +72,7 @@ class BatchPricer:
                 rate=item.rate,
                 dividend=item.dividend,
                 payout=item.payout,
-                resolution=item.resolution,
+                resolution=resolution,
                 allow_extrapolation=item.allow_extrapolation,
                 steps=item.steps,
                 convergence_tol=item.convergence_tol,

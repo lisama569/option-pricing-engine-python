@@ -27,14 +27,45 @@
   `resolution = N`，引擎**恰好**用 N 步 CRR 树算一次，不做任何收敛搜索、
   不替换步数。结果是 `(请求, 曲面版本)` 的确定性函数，同一曲面版本反复跑
   逐位相同，适合复现“固定期数/固定步长”的第三方报价。
-  - 允许范围 **N ∈ [1, 2000]**（常量 `models.MIN_RESOLUTION` /
-    `MAX_RESOLUTION`），区间内每个整数都受理并实际计算；
-  - 越界（0、负数、>2000）由模型层以 `invalid_parameter`（HTTP 422）
-    **明确拒绝**，不会在未到上限时报错，也不会悄悄换成其他步数给近似值；
+  - **允许范围**：`N ∈ [1, 2000]`（常量
+    `resolution.MIN_RESOLUTION` / `MAX_RESOLUTION`，经 `models` 再导出），
+    区间内**每个整数都受理并实际计算**，**边界值 1 与 2000 同样受理**；
+  - **允许的类型只有两种**：JSON 整数（Python `int`，且
+    `isinstance(x, int)` 为真）或省略该字段（`null`，走自动收敛）。
+    规则全部集中在 `option_engine/resolution.py::validate_resolution`
+    这一个函数里，三个入口共用、逐条调用，表现完全一致；
+  - **类型非法一律拒绝，绝不换算成任何步数**（不会出现 `true` 当 1 步、
+    `1.0` 当 1 步、`"100"` 当 100 步这类静默强转）：
+    - 布尔 `true` / `false` → 拒绝（`bool` 虽是 `int` 子类也单独拦截），
+      原因中注明 “got boolean …”；
+    - 浮点 `1.0` / `1.5` / `0.999`（含“整数值浮点”）→ 拒绝，
+      原因中注明实际收到的浮点值；
+    - 字符串 `"100"` / `"1.0"` / `"true"`（任何字符串）→ 拒绝，
+      不做任何数字解析，原因中注明实际收到的字符串；
+    - 其它非整数类型（数组、对象等）→ 拒绝；
+  - **区间外的整数继续拒绝**：0、负数、>2000 均拒绝，
+    **不会在尚未到上限时就报“算不出来”**（2000 照常计算，2001 才拒绝）；
+  - 上述拒绝全部以 `invalid_parameter`（HTTP 422）返回，错误消息会点明
+    **字段名 `resolution`** 与**不可受理的具体原因（类型/区间）**，
+    且**绝不返回任何价格**；
   - `resolution` 只对 `american_put` 合法，欧式闭式解传该字段会收到
     `invalid_parameter`；
   - 固定模式下 `steps / convergence_tol / max_steps` 不参与计算；
     `detail` 为 `{"steps_used": N, "converged": null, "resolution": N}`。
+- **三个入口的一致行为**（同一套规则、同一种判定）：
+  - 同步 `POST /pricing/price`：非法类型在请求体校验阶段返回
+    **422 `invalid_parameter`**，`detail.errors[].loc` 末位为
+    `resolution`，`message` 含字段名与原因；
+  - 异步 `POST /jobs`：非法类型在**提交时**即返回 422
+    （不会创建任务，也不会进入 pending/running）；
+  - 批量 `POST /pricing/price/batch`：条目的原始值先保留、不做整批强转；
+    **某一条 `resolution` 非法时只让这一条失败**（该条
+    `status="failed"`、`error_code="invalid_parameter"`、自带字段级原因、
+    `result=null`），**其余条目照常定价返回**，不会因一条非法值让整批
+    422，也不会拖住或影响其它条目/其它请求；合法条目的结果与单独调用
+    逐字段一致（价格、`vol_used`、`pricing_mode`、`steps_used`）。
+  - 引擎层（`PricingService._compute`）另有一道同样的防御性校验：即使
+    请求对象绕过模型层（如 `model_construct`），脏值也进不了二叉树。
 - `pricing_mode = "auto_converged"`（自动收敛，默认）：不传 `resolution`
   时保持原有行为——从 `steps` 起倍增直到相对变化 < `convergence_tol`，
   `steps_used` 为实际收敛步数；预算 `max_steps` 用尽仍不收敛则抛出
@@ -134,6 +165,12 @@
   `error_code / error_message`（`surface_out_of_range`、
   `solver_non_convergence`、`invalid_parameter` 等），且 `result = null`，
   不拖垮整批。请求体结构非法（如空 `items`）仍在入口返回 422。
+  - **`resolution` 类型/区间非法同样按单条失败处理**：例如某一条传
+    `true`、`1.0` 或 `"100"`，只有这一条返回
+    `status="failed" / error_code="invalid_parameter"` 且消息注明
+    `resolution` 字段与具体原因，其它条目不受影响（批次本身仍为 200）。
+    这与单独调用同步入口收到的失败码/原因完全一致（单独调用表现为
+    HTTP 422，批量内表现为该条 failed）。
 - **与单条调用完全一致**：每条 leg 在内部被构造成与独立调用完全相同的
   `PricingRequest`（含批次绑定的版本）并走同一计算与结果缓存路径，
   因此同一版本下批量每条价格、`vol_used`、`pricing_mode`、`steps_used`、
@@ -189,7 +226,7 @@
 
 | error 码 | 含义 | HTTP |
 | --- | --- | --- |
-| `invalid_parameter` | 参数非法 / pydantic 校验失败 / IV 无可行解 | 422 |
+| `invalid_parameter` | 参数非法 / pydantic 校验失败（含 `resolution` 布尔、浮点、字符串、越界）/ IV 无可行解 | 422 |
 | `surface_out_of_range` | 越界且未获外插授权：未请求外插 / 曲面版本未声明范围 / 超出声明范围 | 422 |
 | `solver_non_convergence` | 数值求解未收敛 | 422 |
 | `surface_not_found` / `job_not_found` | 曲面/版本/任务不存在 | 404 |
@@ -220,6 +257,30 @@ curl -s -X POST localhost:8000/pricing/price -H 'Content-Type: application/json'
   "surface_id":"default","version":1,"option_type":"american_put",
   "expiry":1,"strike":100,"resolution":252}'
 
+# 非法分辨率类型：true / 1.0 / "100" 一律 422 invalid_parameter，
+# 不会被换算成 1 / 1 / 100 步，也不会返回任何价格
+curl -s -i -X POST localhost:8000/pricing/price -H 'Content-Type: application/json' -d '{
+  "surface_id":"default","version":1,"option_type":"american_put",
+  "expiry":1,"strike":100,"resolution":true}'
+# -> HTTP/1.1 422 ; body.error = "invalid_parameter" ;
+#    message 点明字段 resolution 与 “got boolean true”，
+#    detail.errors[0].loc 末位为 "resolution"
+
+# 区间外整数同样 422（边界 1 与 2000 受理，0 与 2001 拒绝）
+curl -s -X POST localhost:8000/pricing/price -H 'Content-Type: application/json' -d '{
+  "surface_id":"default","version":1,"option_type":"american_put",
+  "expiry":1,"strike":100,"resolution":0}'
+
+# 批量：非法分辨率只失败对应条目，其它条目照常定价（整批仍 200）
+curl -s -X POST localhost:8000/pricing/price/batch -H 'Content-Type: application/json' -d '{
+  "surface_id":"default","version":1,"items":[
+    {"option_type":"american_put","expiry":1,"strike":100,"resolution":137},
+    {"option_type":"american_put","expiry":1,"strike":100,"resolution":true},
+    {"option_type":"vanilla_put","expiry":1,"strike":100}]}'
+# -> results[0] succeeded(fixed_resolution,137)
+#    results[1] failed invalid_parameter（原因注明 boolean，result=null）
+#    results[2] succeeded(closed_form)
+
 # 在曲面声明的范围内显式请求外插（响应带 extrapolation 审计块）
 curl -s -X POST localhost:8000/pricing/price -H 'Content-Type: application/json' -d '{
   "surface_id":"tech","version":1,"option_type":"vanilla_call",
@@ -236,14 +297,39 @@ curl -s -X POST localhost:8000/pricing/price/batch -H 'Content-Type: application
 ## 6. 验证方法
 
 ```bash
-uv run pytest                       # 全部用例（45 个）
+uv run pytest                       # 全部用例（78 个）
 uv run pytest tests/test_pricing_benchmark.py -v   # 解析基准对照
 uv run pytest tests/test_resolution.py -v          # 固定分辨率/上下边界/确定性
+uv run pytest tests/test_resolution_types.py -v    # 本次修复：布尔/浮点/字符串
+                                                   # 在同步/异步/批量三入口被拒
 uv run pytest tests/test_extrapolation.py -v       # 外插授权/审计/历史版本
 uv run pytest tests/test_batch.py -v               # 批量：部分失败/版本一致/慢条隔离
 uv run pytest tests/test_validation.py -v          # 非法/越界/不收敛
 uv run pytest tests/test_concurrency.py -v         # 并发发布/版本回放
 uv run pytest tests/test_api.py -v                 # HTTP 契约/取消/外插/批量
+```
+
+本次分辨率类型收紧的本地复现/验证：
+
+```bash
+# 1) 模型层直接复现旧缺陷已被修复（全部应打印 REJECTED）
+uv run python -c "
+from pydantic import ValidationError
+from option_engine.models import PricingRequest
+for v in [True, False, 1.0, 1.5, '100', '1.0']:
+    try:
+        PricingRequest(option_type='american_put', expiry=1.0,
+                       strike=100, resolution=v)
+        print(repr(v), 'ACCEPTED (BUG)')
+    except ValidationError:
+        print(repr(v), 'REJECTED')"
+
+# 2) 三入口行为对照（同步/异步为 422；批量为该条 failed、整批 200）
+uv run uvicorn main:app --port 8000
+# 然后使用上方“使用示例”中的 true / 0 / 批量三条目 curl 命令验证。
+
+# 3) 专门的回归测试（含边界 1 与 2000 仍按精确步数计算、同版本逐位相同）
+uv run pytest tests/test_resolution_types.py -v
 ```
 
 测试日志（stdout 与 caplog 均有）对每个用例打印：
@@ -259,8 +345,9 @@ CASE=version_replay | INPUTS={'versions': [1, 2, 3]} | SURFACE_VERSION=[1,2,3]
 
 ```
 option_engine/
-  errors.py     # 可区分失败原因的异常层级
-  models.py     # Pydantic 请求/响应模型（含分辨率上下界、外插范围、批量模型）
+  errors.py      # 可区分失败原因的异常层级
+  resolution.py  # resolution 唯一校验入口（允许类型/区间/边界；bool/float/str 拒绝）
+  models.py     # Pydantic 请求/响应模型（含分辨率严格类型、外插范围、批量模型）
   surface.py    # 不可变快照、双线性插值、外插授权与审计、版本化存储（原子发布）
   pricing.py    # BSM/数字闭式解、CRR 美式（自动收敛/固定分辨率）、隐含波动率
   service.py    # 版本绑定 + 规范化结果缓存（跨路径一致性）
@@ -269,5 +356,5 @@ option_engine/
   data.py       # 本地 JSON 曲面载入
   api.py        # FastAPI 路由与错误映射
 data/surfaces/  # 本地曲面数据（default v1/v2 禁外插、tech v1 声明外插范围）
-tests/          # 基准/分辨率/外插/批量/非法参数/并发/HTTP 七组测试
+tests/          # 基准/分辨率/分辨率类型/外插/批量/非法参数/并发/HTTP 八组测试
 ```
